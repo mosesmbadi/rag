@@ -57,7 +57,7 @@ def load_llm():
         )
         print("Local LLM loaded successfully!")
 
-def search_pdf(query, k=10, use_hybrid=True):
+def search_pdf(query, k=10, use_hybrid=True, doc_filter=None):
     """
     Search for relevant chunks from the PDF based on the query.
     
@@ -65,64 +65,93 @@ def search_pdf(query, k=10, use_hybrid=True):
         query: The question or search query
         k: Number of top results to return (default: 10)
         use_hybrid: Use hybrid search combining keyword + semantic (default: True)
+        doc_filter: Optional dict to filter by document {'doc_name': 'HumaCount 5D', 'doc_type': 'Service Manual'}
     
     Returns:
-        List of dictionaries with 'text' and 'score' for each result
+        List of dictionaries with 'text', 'score', and metadata for each result
     """
     # Convert query to the same vector space as the indexed chunks
     query_vector = embedding_model.encode(query).tolist()
 
+    # Build the base query
     if use_hybrid:
         # Hybrid search: combine semantic (kNN) and keyword (BM25) search
-        search_query = {
-            "size": k,
-            "query": {
-                "bool": {
-                    "should": [
-                        {
-                            "knn": {
-                                "content_vector": {
-                                    "vector": query_vector,
-                                    "k": k
-                                }
-                            }
-                        },
-                        {
-                            "match": {
-                                "text": {
-                                    "query": query,
-                                    "boost": 0.5  # Lower weight for keyword match
-                                }
+        base_query = {
+            "bool": {
+                "should": [
+                    {
+                        "knn": {
+                            "content_vector": {
+                                "vector": query_vector,
+                                "k": k
                             }
                         }
-                    ]
-                }
+                    },
+                    {
+                        "match": {
+                            "text": {
+                                "query": query,
+                                "boost": 0.5  # Lower weight for keyword match
+                            }
+                        }
+                    }
+                ]
             }
         }
     else:
         # Pure semantic search
-        search_query = {
-            "size": k,
-            "query": {
-                "knn": {
-                    "content_vector": {
-                        "vector": query_vector,
-                        "k": k
-                    }
+        base_query = {
+            "knn": {
+                "content_vector": {
+                    "vector": query_vector,
+                    "k": k
                 }
             }
         }
+    
+    # Add document filters if specified
+    if doc_filter:
+        filter_clauses = []
+        if 'doc_name' in doc_filter:
+            filter_clauses.append({"term": {"doc_name": doc_filter['doc_name']}})
+        if 'doc_type' in doc_filter:
+            filter_clauses.append({"term": {"doc_type": doc_filter['doc_type']}})
+        
+        if filter_clauses:
+            if use_hybrid:
+                base_query['bool']['filter'] = filter_clauses
+            else:
+                base_query = {
+                    "bool": {
+                        "must": [base_query],
+                        "filter": filter_clauses
+                    }
+                }
+    
+    search_query = {
+        "size": k,
+        "query": base_query
+    }
 
     try:
         response = client.search(index=index_name, body=search_query)
         
-        # Extract the text chunks with their relevance scores
+        # Extract the text chunks with their relevance scores and metadata
         results = []
         for hit in response['hits']['hits']:
-            results.append({
+            result = {
                 'text': hit['_source']['text'],
                 'score': hit['_score']
-            })
+            }
+            # Add metadata if available
+            if 'doc_name' in hit['_source']:
+                result['doc_name'] = hit['_source']['doc_name']
+            if 'doc_type' in hit['_source']:
+                result['doc_type'] = hit['_source']['doc_type']
+            if 'source_file' in hit['_source']:
+                result['source_file'] = hit['_source']['source_file']
+            
+            results.append(result)
         return results
     except Exception as e:
         print(f"Error searching: {e}")
@@ -225,7 +254,7 @@ Answer based strictly on the context above:</|user|>
     
     return answer
 
-def answer_question(question, k=10, use_llm=True):
+def answer_question(question, k=10, use_llm=True, doc_filter=None):
     """
     Answer a question based on the PDF content.
     
@@ -233,11 +262,12 @@ def answer_question(question, k=10, use_llm=True):
         question: The question to answer
         k: Number of relevant chunks to retrieve (default: 10)
         use_llm: Whether to use LLM for answer generation (default: True)
+        doc_filter: Optional dict to filter by document {'doc_name': 'HumaCount 5D', 'doc_type': 'Service Manual'}
     
     Returns:
         Dictionary with 'answer' and 'sources'
     """
-    results = search_pdf(question, k)
+    results = search_pdf(question, k, doc_filter=doc_filter)
     
     if not results:
         return {
@@ -265,8 +295,11 @@ if __name__ == "__main__":
     # Can be run from command line: python query.py "your question here"
     # Add --raw flag to see raw chunks without LLM processing
     # Add --debug to see all retrieved chunks
+    # Add --doc "HumaCount 5D" to filter by document name
+    # Add --type "Service Manual" to filter by document type
     use_llm = True
     debug = False
+    doc_filter = {}
     args = sys.argv[1:]
     
     if "--raw" in args:
@@ -277,25 +310,41 @@ if __name__ == "__main__":
         debug = True
         args.remove("--debug")
     
+    # Parse document filter
+    if "--doc" in args:
+        idx = args.index("--doc")
+        doc_filter['doc_name'] = args[idx + 1]
+        args.pop(idx)
+        args.pop(idx)
+    
+    if "--type" in args:
+        idx = args.index("--type")
+        doc_filter['doc_type'] = args[idx + 1]
+        args.pop(idx)
+        args.pop(idx)
+    
     if len(args) > 0:
         question = " ".join(args)
     else:
         question = input("Enter your question: ")
     
-    print(f"\nSearching for: {question}\n")
-    print("=" * 80)
+    print(f"\nSearching for: {question}")
+    if doc_filter:
+        print(f"Filtering by: {doc_filter}")
+    print("\n" + "=" * 80)
     
-    result = answer_question(question, use_llm=use_llm)
+    result = answer_question(question, use_llm=use_llm, doc_filter=doc_filter)
     
     print(f"\nAnswer:\n{result['answer']}")
     print("\n" + "=" * 80)
     print(f"\nFound {len(result['sources'])} relevant chunks from the PDF.")
     
-    # Show the source chunks
+    # Show the source chunks with metadata
     num_chunks_to_show = len(result['sources']) if debug else min(5, len(result['sources']))
     if use_llm or debug:
         print(f"\nTop {num_chunks_to_show} retrieved context chunks:")
         for i, source in enumerate(result['sources'][:num_chunks_to_show], 1):
-            print(f"\n[Chunk {i}] (Relevance: {source['score']:.3f})")
+            doc_info = f"{source.get('doc_name', 'Unknown')} - {source.get('doc_type', 'Unknown')}"
+            print(f"\n[Chunk {i}] (Relevance: {source['score']:.3f}) [{doc_info}]")
             preview = source['text'][:300] + "..." if len(source['text']) > 300 else source['text']
             print(preview)
