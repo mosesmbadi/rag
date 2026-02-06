@@ -5,5 +5,5 @@ transformers
 torch
 python-dotenv
 accelerate
-google-generativeai
+google-genai
 

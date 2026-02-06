@@ -11,3 +11,5 @@ venv/
 # App data
 uploads/
 db/
+
+data/

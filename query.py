@@ -26,16 +26,17 @@ MAX_ANSWER_LENGTH = int(os.getenv('MAX_ANSWER_LENGTH', '500'))
 gemini_model = None
 if LLM_PROVIDER == 'gemini':
     try:
-        import google.generativeai as genai
+        from google import genai
+        from google.genai import types
         if GEMINI_API_KEY:
-            genai.configure(api_key=GEMINI_API_KEY)
-            gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+            client_genai = genai.Client(api_key=GEMINI_API_KEY)
+            gemini_model = client_genai
             print(f"Using Gemini API ({GEMINI_MODEL})")
         else:
             print("Warning: GEMINI_API_KEY not set in .env file")
             LLM_PROVIDER = 'local'
     except ImportError:
-        print("Warning: google-generativeai not installed. Install with: pip install google-generativeai")
+        print("Warning: google-genai not installed. Install with: pip install google-genai")
         LLM_PROVIDER = 'local'
 
 # Initialize local LLM (lazy loading)
@@ -194,7 +195,10 @@ Instructions:
 Answer:"""
 
     try:
-        response = gemini_model.generate_content(prompt)
+        response = gemini_model.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt
+        )
         return response.text
     except Exception as e:
         return f"Error generating answer with Gemini: {e}"

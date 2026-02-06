@@ -5,7 +5,7 @@ from opensearchpy import OpenSearch
 from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
 
-# 1. SETUP: Connect to OpenSearch and load the Embedding Model
+# 1. SETUP: Connect to vector-based OpenSearch and load the Embedding Model
 # No authentication needed since DISABLE_SECURITY_PLUGIN=true
 client = OpenSearch(
     hosts=[{'host': 'localhost', 'port': 9200}],
