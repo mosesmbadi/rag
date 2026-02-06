@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtualenv
+venv/
+
+# Local config
+.env
+
+# App data
+uploads/
+db/

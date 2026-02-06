@@ -1,0 +1,9 @@
+opensearch-py
+sentence-transformers
+pypdf
+transformers
+torch
+python-dotenv
+accelerate
+google-generativeai
+
