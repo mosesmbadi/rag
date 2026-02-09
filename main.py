@@ -1,6 +1,7 @@
 # This code will chunk given data and call embedding code to embedd the data.
 import sys
 import os
+import re
 from opensearchpy import OpenSearch
 from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
@@ -117,34 +118,49 @@ except Exception as e:
     print(f"Warning: Could not create index explicitly ({e}). Will try auto-creation on first document insert.")
 
 # 4. EMBEDDING & STORAGE: Process PDFs
-# Define your documents here
-documents = [
-    {
-        'path': '/home/mbadi/Desktop/work/chemlabs/chemlabs_rag/data/humacount_5d_sm.pdf',
-        'name': 'HumaCount 5D',
-        'type': 'Service Manual'
-    },
-    {
-        'path': '/home/mbadi/Desktop/work/chemlabs/chemlabs_rag/data/Humalyte-Plus3-LIS-InterfaceManual_V1.pdf',
-        'name': 'Humalyte Plus 3',
-        'type': 'LIS Integration Guide'
-    },
-    {
-        'path': '/home/mbadi/Desktop/work/chemlabs/chemlabs_rag/data/Humaclot_Junior_User_Manual-186802.pdf',
-        'name': 'Humaclot Junior',
-        'type': 'User Manual'
-    },
-    {
-        'path': '/home/mbadi/Desktop/work/chemlabs/chemlabs_rag/data/User_Manual_Humalyte_Plus_3.pdf',
-        'name': 'Humalyte Plus 3',
-        'type': 'User Manual'
-    },
-    {
-        'path': '/home/mbadi/Desktop/work/chemlabs/chemlabs_rag/data/Humastar_100-200_User_Manual.pdf',
-        'name': 'HumaStar 100, 200',
-        'type': 'User Manual'
-    },
-]
+def normalize_doc_key(filename):
+    base = os.path.splitext(filename)[0]
+    return re.sub(r"[^a-z0-9]+", "", base.lower())
+
+
+def clean_doc_name(filename):
+    base = os.path.splitext(filename)[0]
+    base = re.sub(r"\(\d+\)$", "", base).strip()
+    base = base.replace("_", " ").replace("-", " ")
+    return re.sub(r"\s+", " ", base).strip()
+
+
+def infer_doc_type(filename):
+    lower = filename.lower()
+    if "lis" in lower or "interface" in lower:
+        return "LIS Integration Guide"
+    if "service manual" in lower or lower.endswith("_sm.pdf") or " sm.pdf" in lower:
+        return "Service Manual"
+    if "user manual" in lower or "manual" in lower:
+        return "User Manual"
+    return "Document"
+
+
+data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+pdf_files = sorted(
+    file_name for file_name in os.listdir(data_dir)
+    if file_name.lower().endswith(".pdf")
+)
+
+documents = []
+seen = set()
+
+for file_name in pdf_files:
+    key = normalize_doc_key(file_name)
+    if key in seen:
+        continue
+    seen.add(key)
+
+    documents.append({
+        "path": os.path.join(data_dir, file_name),
+        "name": clean_doc_name(file_name),
+        "type": infer_doc_type(file_name)
+    })
 
 try:
     all_chunks = []

@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 from opensearchpy import OpenSearch
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
@@ -14,6 +15,111 @@ client = OpenSearch(
 )
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 index_name = "my_pdf_index"
+
+
+def normalize_doc_key(text):
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def tokenize_for_match(text):
+    cleaned = re.sub(r"[^a-z0-9]+", " ", text.lower())
+    tokens = [token for token in cleaned.split() if token]
+    stopwords = {
+        "user",
+        "manual",
+        "service",
+        "lis",
+        "interface",
+        "guide",
+        "version",
+        "ver",
+        "v"
+    }
+    return [token for token in tokens if token not in stopwords]
+
+
+def clean_doc_name(filename):
+    base = os.path.splitext(filename)[0]
+    base = re.sub(r"\(\d+\)$", "", base).strip()
+    base = base.replace("_", " ").replace("-", " ")
+    return re.sub(r"\s+", " ", base).strip()
+
+
+def infer_doc_type(filename):
+    lower = filename.lower()
+    if "lis" in lower or "interface" in lower:
+        return "LIS Integration Guide"
+    if "service manual" in lower or lower.endswith("_sm.pdf") or " sm.pdf" in lower:
+        return "Service Manual"
+    if "user manual" in lower or "manual" in lower:
+        return "User Manual"
+    return "Document"
+
+
+def build_document_catalog():
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    if not os.path.isdir(data_dir):
+        return []
+
+    pdf_files = sorted(
+        file_name for file_name in os.listdir(data_dir)
+        if file_name.lower().endswith(".pdf")
+    )
+
+    catalog = []
+    seen = set()
+    for file_name in pdf_files:
+        key = normalize_doc_key(os.path.splitext(file_name)[0])
+        if key in seen:
+            continue
+        seen.add(key)
+        catalog.append({
+            "doc_name": clean_doc_name(file_name),
+            "doc_type": infer_doc_type(file_name),
+            "source_file": file_name,
+            "match_tokens": tokenize_for_match(clean_doc_name(file_name))
+        })
+    return catalog
+
+
+DOCUMENT_CATALOG = build_document_catalog()
+
+
+def infer_doc_filter_from_question(question):
+    if not DOCUMENT_CATALOG:
+        return None
+
+    normalized_question = normalize_doc_key(question)
+    question_tokens = set(tokenize_for_match(question))
+    best_match = None
+    best_score = 0
+
+    for entry in DOCUMENT_CATALOG:
+        doc_key = normalize_doc_key(entry["doc_name"])
+        if not doc_key:
+            continue
+        if doc_key in normalized_question:
+            score = len(doc_key)
+            if score > best_score:
+                best_score = score
+                best_match = entry
+
+        if question_tokens and entry["match_tokens"]:
+            overlap = question_tokens.intersection(entry["match_tokens"])
+            if overlap:
+                score = len(overlap) * 10 + sum(len(token) for token in overlap)
+                if score > best_score:
+                    best_score = score
+                    best_match = entry
+
+    if best_match:
+        return {
+            "doc_name": best_match["doc_name"],
+            "doc_type": best_match["doc_type"],
+            "source_file": best_match["source_file"]
+        }
+
+    return None
 
 # Load LLM configuration
 LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'gemini')
@@ -117,6 +223,8 @@ def search_pdf(query, k=10, use_hybrid=True, doc_filter=None):
             filter_clauses.append({"term": {"doc_name": doc_filter['doc_name']}})
         if 'doc_type' in doc_filter:
             filter_clauses.append({"term": {"doc_type": doc_filter['doc_type']}})
+        if 'source_file' in doc_filter:
+            filter_clauses.append({"term": {"source_file": doc_filter['source_file']}})
         
         if filter_clauses:
             if use_hybrid:
@@ -271,7 +379,10 @@ def answer_question(question, k=10, use_llm=True, doc_filter=None):
     Returns:
         Dictionary with 'answer' and 'sources'
     """
-    results = search_pdf(question, k, doc_filter=doc_filter)
+    effective_filter = doc_filter or infer_doc_filter_from_question(question)
+    results = search_pdf(question, k, doc_filter=effective_filter)
+    if not results and effective_filter:
+        results = search_pdf(question, k, doc_filter=None)
     
     if not results:
         return {
@@ -292,7 +403,8 @@ def answer_question(question, k=10, use_llm=True, doc_filter=None):
     
     return {
         'answer': answer,
-        'sources': results
+        'sources': results,
+        'doc_filter': effective_filter
     }
 
 if __name__ == "__main__":
@@ -339,6 +451,12 @@ if __name__ == "__main__":
     
     result = answer_question(question, use_llm=use_llm, doc_filter=doc_filter)
     
+    if result.get('doc_filter') and not doc_filter:
+        print(f"Auto-filtering by: {result['doc_filter']}")
+
+    if result.get('doc_filter'):
+        print(f"Auto-filtering by: {result['doc_filter']}")
+
     print(f"\nAnswer:\n{result['answer']}")
     print("\n" + "=" * 80)
     print(f"\nFound {len(result['sources'])} relevant chunks from the PDF.")
