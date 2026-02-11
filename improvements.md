@@ -1,0 +1,9 @@
+DONE: Indexing performance: switch from per‑chunk client.index(...) to OpenSearch bulk indexing, and batch model.encode(...) to reduce latency and memory spikes. This is a major bottleneck in main.py.
+DONE: Deterministic document IDs + rebuild option: doc_id increments on each run, so re‑indexing creates duplicates. Use a stable ID (e.g., hash of source_file + chunk_index) and add a --rebuild or --delete-index flag in main.py.
+DONE: Chunking quality: current chunking is character‑based and ignores sentence boundaries or token limits. Consider sentence/paragraph chunking with a tokenizer‑aware size cap (e.g., 300‑500 tokens) for better retrieval precision in main.py.
+DONE: Metadata depth: store page numbers, section headers, and chunk offsets to enable precise citations and better filtering. You already include doc_name/doc_type, but no page info in main.py.
+Retrieval quality: hybrid query mixes knn and match without tuning num_candidates for kNN; add it and consider minimum_should_match to avoid weak keyword hits dominating. See query.py.
+Reranking: add a lightweight reranker (e.g., cross-encoder/ms-marco-MiniLM-L-6-v2) on the top‑N results for more accurate final context selection in query.py.
+Answer grounding: the LLM outputs aren’t tied to citations. Include chunk IDs/page numbers in the answer and return a short list of sources to improve trust for field engineers in query.py.
+Prompt/context safety: you use a strong constraint for local LLM, but Gemini prompt allows longer responses without an explicit refusal template. Add a concise “cannot find in context” template and ensure it always triggers on low‑confidence matches in query.py.
+Config + ops: make OpenSearch host/port/index name configurable via env vars and add a connectivity check with clear error output in main.py and query.py.
