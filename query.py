@@ -57,28 +57,45 @@ def infer_doc_type(filename):
 
 
 def build_document_catalog():
-    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    _default_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    data_dir = os.getenv("DATA_DIR", _default_data_dir)
+    if not os.path.isabs(data_dir):
+        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), data_dir)
     if not os.path.isdir(data_dir):
         return []
 
-    pdf_files = sorted(
-        file_name for file_name in os.listdir(data_dir)
-        if file_name.lower().endswith(".pdf")
-    )
-
     catalog = []
     seen = set()
-    for file_name in pdf_files:
-        key = normalize_doc_key(os.path.splitext(file_name)[0])
-        if key in seen:
-            continue
-        seen.add(key)
-        catalog.append({
-            "doc_name": clean_doc_name(file_name),
-            "doc_type": infer_doc_type(file_name),
-            "source_file": file_name,
-            "match_tokens": tokenize_for_match(clean_doc_name(file_name))
-        })
+
+    for root, dirs, files in os.walk(data_dir):
+        for file_name in sorted(files):
+            ext = os.path.splitext(file_name)[1].lower()
+            if ext not in ('.pdf', '.csv'):
+                continue
+
+            key = normalize_doc_key(os.path.splitext(file_name)[0])
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if ext == '.pdf':
+                catalog.append({
+                    "doc_name": clean_doc_name(file_name),
+                    "doc_type": infer_doc_type(file_name),
+                    "source_file": file_name,
+                    "source_type": "pdf",
+                    "match_tokens": tokenize_for_match(clean_doc_name(file_name))
+                })
+            elif ext == '.csv':
+                table_name = os.path.splitext(file_name)[0]
+                catalog.append({
+                    "doc_name": table_name,
+                    "doc_type": "CSV Data",
+                    "source_file": file_name,
+                    "source_type": "csv",
+                    "match_tokens": tokenize_for_match(table_name.replace('_', ' '))
+                })
+
     return catalog
 
 
@@ -253,12 +270,9 @@ def search_pdf(query, k=10, use_hybrid=True, doc_filter=None):
                 'score': hit['_score']
             }
             # Add metadata if available
-            if 'doc_name' in hit['_source']:
-                result['doc_name'] = hit['_source']['doc_name']
-            if 'doc_type' in hit['_source']:
-                result['doc_type'] = hit['_source']['doc_type']
-            if 'source_file' in hit['_source']:
-                result['source_file'] = hit['_source']['source_file']
+            for field in ('doc_name', 'doc_type', 'source_file', 'source_type', 'table_name'):
+                if field in hit['_source']:
+                    result[field] = hit['_source'][field]
             
             results.append(result)
         return results
@@ -280,14 +294,22 @@ def generate_answer_with_gemini(question, context_chunks):
     if not gemini_model:
         return "Gemini API not configured. Please set GEMINI_API_KEY in .env file."
     
-    # Combine context chunks with clear separation - use up to 5 chunks
+    # Combine context chunks with clear separation - use up to 8 chunks
+    # for better cross-table coverage
     context_parts = []
-    for i, chunk in enumerate(context_chunks[:5], 1):
-        context_parts.append(f"[Context {i}]:\n{chunk['text']}")
+    for i, chunk in enumerate(context_chunks[:8], 1):
+        source_label = chunk.get('table_name') or chunk.get('doc_name', '')
+        source_type = chunk.get('source_type', 'unknown')
+        context_parts.append(f"[Context {i} | source: {source_label} ({source_type})]:\n{chunk['text']}")
     context = "\n\n".join(context_parts)
     
-    # Create prompt for Gemini - clear and direct
+    # Create prompt for Gemini - aware of relational data
     prompt = f"""Answer the following question using the information from the provided context.
+
+The context may contain data from multiple related database tables or documents.
+Foreign key columns (ending in _id) link records across tables. Resolved names
+(ending in _name) show the human-readable value for those foreign keys.
+Use information from ALL relevant context chunks to build a complete answer.
 
 Context:
 {context}
@@ -296,6 +318,7 @@ Question: {question}
 
 Instructions:
 - Extract and synthesize relevant information from the context
+- Cross-reference data from different tables when answering
 - If you find the answer in the context, provide it clearly and completely
 - If information is incomplete, state what is available
 - Do not add information not in the context
@@ -326,8 +349,9 @@ def generate_answer_with_local_llm(question, context_chunks):
     
     # Combine context chunks with clear separation
     context_parts = []
-    for i, chunk in enumerate(context_chunks[:3], 1):
-        context_parts.append(f"[Context {i}]:\n{chunk['text']}")
+    for i, chunk in enumerate(context_chunks[:5], 1):
+        source_label = chunk.get('table_name') or chunk.get('doc_name', '')
+        context_parts.append(f"[Context {i} | source: {source_label}]:\n{chunk['text']}")
     context = "\n\n".join(context_parts)
     
     # Create a more strict prompt to reduce hallucinations
@@ -392,9 +416,9 @@ def answer_question(question, k=10, use_llm=True, doc_filter=None):
     
     if use_llm:
         # Generate answer using configured LLM provider
-        # Use more chunks for better context
+        # Use more chunks for better cross-table context
         if LLM_PROVIDER == 'gemini':
-            answer = generate_answer_with_gemini(question, results[:5])
+            answer = generate_answer_with_gemini(question, results[:8])
         else:
             answer = generate_answer_with_local_llm(question, results[:5])
     else:

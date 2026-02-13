@@ -6,9 +6,12 @@ from dotenv import load_dotenv
 from opensearchpy import OpenSearch, helpers
 from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
+import csv
+import json
 import nltk
 from nltk.tokenize import sent_tokenize
 import tiktoken
+from collections import defaultdict
 
 # Load environment variables from .env file
 load_dotenv()
@@ -38,8 +41,155 @@ CHUNK_MAX_TOKENS = int(os.getenv("CHUNK_MAX_TOKENS", "500"))
 CHUNK_OVERLAP_TOKENS = int(os.getenv("CHUNK_OVERLAP_TOKENS", "50"))
 PARAGRAPH_BREAK_NEWLINES = int(os.getenv("PARAGRAPH_BREAK_NEWLINES", "2"))
 
+# CSV chunking configuration
+CSV_ROWS_PER_CHUNK = int(os.getenv("CSV_ROWS_PER_CHUNK", "50"))
+
 # Initialize tokenizer for accurate token counting
 tokenizer = tiktoken.get_encoding("cl100k_base")  # GPT-4 tokenizer
+
+
+# ── FK RESOLUTION: Build lookup tables from reference CSVs ──────────────────
+
+def build_lookup_tables(csv_dir):
+    """
+    Scan all CSV files under csv_dir. For every file that has both 'id' and
+    'name' columns, build a lookup dict  {id_string: name_string}.
+
+    Returns two dicts:
+      - lookups:        {table_key: {id: name}}   e.g. {"program": {"4": "HuQAS"}}
+      - table_key_map:  {table_key: full_table_name}  e.g. {"program": "catalog_program"}
+    """
+    lookups = {}          # table_key → {id → name}
+    table_key_map = {}    # table_key → original table name (without ext)
+
+    for root, _dirs, files in os.walk(csv_dir):
+        for fname in files:
+            if not fname.lower().endswith('.csv'):
+                continue
+            path = os.path.join(root, fname)
+            table_name = os.path.splitext(fname)[0]          # e.g. catalog_program
+
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+                    reader = csv.DictReader(fh)
+                    if not reader.fieldnames:
+                        continue
+                    cols = [c.strip() for c in reader.fieldnames]
+                    if 'id' not in cols or 'name' not in cols:
+                        continue
+
+                    id_to_name = {}
+                    for row in reader:
+                        rid = (row.get('id') or '').strip()
+                        rname = (row.get('name') or '').strip()
+                        if rid and rname:
+                            id_to_name[rid] = rname
+
+                    if not id_to_name:
+                        continue
+
+                    # Derive a short key by stripping common prefixes
+                    # catalog_program → program, labs_lab → lab, test_events_event → event
+                    parts = table_name.split('_')
+                    # Try progressively shorter suffixes to avoid collisions
+                    for i in range(len(parts)):
+                        candidate = '_'.join(parts[i:])
+                        if candidate not in lookups:
+                            lookups[candidate] = id_to_name
+                            table_key_map[candidate] = table_name
+                            break
+                    else:
+                        lookups[table_name] = id_to_name
+                        table_key_map[table_name] = table_name
+
+            except Exception:
+                continue  # skip unreadable files
+
+    return lookups, table_key_map
+
+
+def resolve_foreign_keys(row, headers, lookups):
+    """
+    For every column ending with '_id', try to resolve it via the lookup
+    tables.  Returns a *new* dict with both the original id and the resolved
+    human-readable name.
+
+    Example:
+        program_id=4  →  program_id=4, program_name=HuQAS
+    """
+    resolved = {}
+    for col in headers:
+        val = (row.get(col) or '').strip()
+        if not val or val in ('--', '-----', '""', "''"):
+            continue
+        resolved[col] = val
+
+        if col.endswith('_id'):
+            fk_base = col[:-3]  # program_id → program
+            # Skip audit columns – they don't add useful search context
+            if fk_base in ('created_by', 'updated_by', 'approved_by',
+                           'confirmed_by', 'reviewed_by', 'lab_user'):
+                continue
+            # Look up by the FK base name (e.g. "program", "lab", "analyte")
+            lookup = lookups.get(fk_base)
+            if lookup and val in lookup:
+                resolved[f"{fk_base}_name"] = lookup[val]
+    return resolved
+
+
+def build_schema_document(csv_dir, lookups, table_key_map):
+    """
+    Generate a text document describing every CSV table, its columns, and
+    which FK columns link to which reference tables.  This chunk is indexed
+    so the LLM can reason about cross-table relationships.
+    """
+    lines = [
+        "DATABASE SCHEMA AND TABLE RELATIONSHIPS",
+        "=" * 50,
+        "This document describes all data tables, their columns, "
+        "and how they relate to each other via foreign keys.\n"
+    ]
+
+    # Build reverse map: table_key → full_table_name
+    key_to_full = {v: k for k, v in table_key_map.items()}  # full→key
+
+    tables_info = []  # (table_name, cols, fk_descriptions)
+    for root, _dirs, files in os.walk(csv_dir):
+        for fname in sorted(files):
+            if not fname.lower().endswith('.csv'):
+                continue
+            path = os.path.join(root, fname)
+            table_name = os.path.splitext(fname)[0]
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+                    reader = csv.DictReader(fh)
+                    if not reader.fieldnames:
+                        continue
+                    cols = [c.strip() for c in reader.fieldnames]
+            except Exception:
+                continue
+
+            fk_descs = []
+            for col in cols:
+                if col.endswith('_id'):
+                    fk_base = col[:-3]
+                    if fk_base in lookups:
+                        ref_table = table_key_map.get(fk_base, fk_base)
+                        fk_descs.append(f"  - {col} → references {ref_table}.id (lookup by name)")
+                    else:
+                        fk_descs.append(f"  - {col} → references related table")
+
+            tables_info.append((table_name, cols, fk_descs))
+
+    for table_name, cols, fk_descs in tables_info:
+        lines.append(f"Table: {table_name}")
+        lines.append(f"  Columns: {', '.join(cols)}")
+        if fk_descs:
+            lines.append("  Foreign keys:")
+            lines.extend(fk_descs)
+        lines.append("")
+
+    return "\n".join(lines)
 
 # 2. CHUNKING: Read PDF and split into paragraph-aware, token-limited chunks with page metadata
 def get_chunks_with_pages(pdf_path, min_tokens=CHUNK_MIN_TOKENS, max_tokens=CHUNK_MAX_TOKENS, overlap_tokens=CHUNK_OVERLAP_TOKENS):
@@ -189,6 +339,8 @@ def process_pdf(pdf_path, doc_name, doc_type):
             'text': chunk_data['text'],
             'doc_name': doc_name,
             'doc_type': doc_type,
+            'source_type': 'pdf',
+            'table_name': '',
             'chunk_index': i,
             'source_file': os.path.basename(pdf_path),
             'start_page': chunk_data['start_page'],
@@ -197,6 +349,117 @@ def process_pdf(pdf_path, doc_name, doc_type):
         })
     
     return chunks_with_metadata
+
+
+# 2b. CHUNKING: Read CSV and split into token-limited chunks with row metadata
+def get_csv_chunks(csv_path, max_tokens=CHUNK_MAX_TOKENS, lookups=None):
+    """
+    Read a CSV file and create denormalized text chunks.
+
+    Foreign key columns (ending in _id) are resolved to human-readable names
+    using the lookup tables, making the chunks semantically searchable.
+
+    Args:
+        csv_path: Path to the CSV file
+        max_tokens: Maximum tokens per chunk
+        lookups: dict of {fk_base: {id: name}} for FK resolution
+
+    Returns:
+        List of dicts with 'text', 'start_row', 'end_row', 'row_range'
+    """
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+    if lookups is None:
+        lookups = {}
+
+    table_name = os.path.splitext(os.path.basename(csv_path))[0]
+
+    chunks = []
+    with open(csv_path, 'r', encoding='utf-8', errors='replace') as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            return chunks
+
+        headers = [c.strip() for c in reader.fieldnames]
+        header_text = f"Table: {table_name}\nColumns: {', '.join(headers)}\n\n"
+        header_tokens = len(tokenizer.encode(header_text))
+
+        current_rows = []
+        current_tokens = header_tokens
+        start_row = 1
+
+        for row_num, row in enumerate(reader, start=1):
+            # Resolve FKs to human-readable names
+            resolved = resolve_foreign_keys(row, headers, lookups)
+            if not resolved:
+                continue
+
+            # Build compact key=value text with resolved names
+            row_text = ", ".join(f"{k}={v}" for k, v in resolved.items())
+            row_tokens = len(tokenizer.encode(row_text))
+
+            # If adding this row would exceed limit, finalize current chunk
+            if current_tokens + row_tokens > max_tokens and current_rows:
+                chunk_text = header_text + "\n".join(current_rows)
+                chunks.append({
+                    'text': chunk_text,
+                    'start_row': start_row,
+                    'end_row': row_num - 1,
+                    'row_range': f"rows {start_row}-{row_num - 1}"
+                })
+                current_rows = []
+                current_tokens = header_tokens
+                start_row = row_num
+
+            current_rows.append(row_text)
+            current_tokens += row_tokens
+
+        # Final chunk
+        if current_rows:
+            end_row = start_row + len(current_rows) - 1
+            chunk_text = header_text + "\n".join(current_rows)
+            chunks.append({
+                'text': chunk_text,
+                'start_row': start_row,
+                'end_row': end_row,
+                'row_range': f"rows {start_row}-{end_row}"
+            })
+
+    return chunks
+
+
+def process_csv(csv_path, lookups=None):
+    """
+    Process a single CSV file and return chunks with metadata.
+
+    Args:
+        csv_path: Path to the CSV file
+        lookups: dict of {fk_base: {id: name}} for FK resolution
+
+    Returns:
+        List of dicts with 'text' and metadata including row range
+    """
+    table_name = os.path.splitext(os.path.basename(csv_path))[0]
+    chunks = get_csv_chunks(csv_path, lookups=lookups)
+
+    chunks_with_metadata = []
+    for i, chunk_data in enumerate(chunks):
+        chunks_with_metadata.append({
+            'text': chunk_data['text'],
+            'doc_name': table_name,
+            'doc_type': 'CSV Data',
+            'source_type': 'csv',
+            'table_name': table_name,
+            'chunk_index': i,
+            'source_file': os.path.basename(csv_path),
+            'start_page': chunk_data['start_row'],
+            'end_page': chunk_data['end_row'],
+            'page_numbers': chunk_data['row_range']
+        })
+
+    return chunks_with_metadata
+
 
 # 3. INDEXING: Create or use existing OpenSearch index with k-NN enabled
 index_name = "my_pdf_index"
@@ -220,11 +483,13 @@ index_body = {
             "text": {"type": "text"},
             "doc_name": {"type": "keyword"},
             "doc_type": {"type": "keyword"},
+            "source_type": {"type": "keyword"},  # "pdf" or "csv"
+            "table_name": {"type": "keyword"},   # CSV table name
             "chunk_index": {"type": "integer"},
             "source_file": {"type": "keyword"},
-            "page_numbers": {"type": "keyword"},  # Display format: "5" or "5-7"
-            "start_page": {"type": "integer"},    # For filtering/sorting
-            "end_page": {"type": "integer"}       # For range queries
+            "page_numbers": {"type": "keyword"},  # Pages ("5" or "5-7") or rows ("rows 1-50")
+            "start_page": {"type": "integer"},    # Page or row start
+            "end_page": {"type": "integer"}       # Page or row end
         }
     }
 }
@@ -264,26 +529,54 @@ def infer_doc_type(filename):
     return "Document"
 
 
-data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-pdf_files = sorted(
-    file_name for file_name in os.listdir(data_dir)
-    if file_name.lower().endswith(".pdf")
-)
+# Data directory from env, defaulting to ./data relative to this script
+_default_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+data_dir = os.getenv("DATA_DIR", _default_data_dir)
+if not os.path.isabs(data_dir):
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), data_dir)
 
+if not os.path.isdir(data_dir):
+    print(f"Error: Data directory not found: {data_dir}")
+    sys.exit(1)
+
+# ── Build FK lookup tables from reference CSVs ──────────────────────────────
+print("Building FK lookup tables from reference CSVs...")
+lookups, table_key_map = build_lookup_tables(data_dir)
+print(f"  Loaded {len(lookups)} reference tables: {', '.join(sorted(table_key_map.values()))}")
+
+# Discover all supported files recursively (PDFs + CSVs)
+SUPPORTED_EXTENSIONS = {'.pdf', '.csv'}
 documents = []
 seen = set()
 
-for file_name in pdf_files:
-    key = normalize_doc_key(file_name)
-    if key in seen:
-        continue
-    seen.add(key)
+for root, dirs, files in os.walk(data_dir):
+    for file_name in sorted(files):
+        ext = os.path.splitext(file_name)[1].lower()
+        if ext not in SUPPORTED_EXTENSIONS:
+            continue
 
-    documents.append({
-        "path": os.path.join(data_dir, file_name),
-        "name": clean_doc_name(file_name),
-        "type": infer_doc_type(file_name)
-    })
+        key = normalize_doc_key(file_name)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        file_path = os.path.join(root, file_name)
+
+        if ext == '.pdf':
+            documents.append({
+                "path": file_path,
+                "name": clean_doc_name(file_name),
+                "type": infer_doc_type(file_name),
+                "file_type": "pdf"
+            })
+        elif ext == '.csv':
+            table_name = os.path.splitext(file_name)[0]
+            documents.append({
+                "path": file_path,
+                "name": table_name,
+                "type": "CSV Data",
+                "file_type": "csv"
+            })
 
 try:
     doc_id = 0
@@ -291,11 +584,64 @@ try:
     doc_chunk_counts = {}
     batch_size = BATCH_SIZE
 
+    # ── Index schema document first ─────────────────────────────────────────
+    schema_text = build_schema_document(data_dir, lookups, table_key_map)
+    if schema_text:
+        print("\nIndexing database schema & relationships document...")
+        schema_vector = model.encode(schema_text).tolist()
+        # The schema can be long; split if needed, but usually one chunk is fine
+        schema_chunks = []
+        schema_tokens = len(tokenizer.encode(schema_text))
+        if schema_tokens <= CHUNK_MAX_TOKENS * 3:
+            schema_chunks = [schema_text]
+        else:
+            # Split into sections by table
+            sections = schema_text.split('\nTable: ')
+            current = sections[0]  # header
+            for section in sections[1:]:
+                section_full = '\nTable: ' + section
+                if len(tokenizer.encode(current + section_full)) > CHUNK_MAX_TOKENS:
+                    schema_chunks.append(current)
+                    current = "DATABASE SCHEMA (continued)\n" + section_full
+                else:
+                    current += section_full
+            if current:
+                schema_chunks.append(current)
+
+        for si, s_text in enumerate(schema_chunks):
+            s_vector = model.encode(s_text).tolist()
+            client.index(
+                index=index_name,
+                id=str(doc_id),
+                body={
+                    "text": s_text,
+                    "content_vector": s_vector,
+                    "doc_name": "database_schema",
+                    "doc_type": "Schema",
+                    "source_type": "schema",
+                    "table_name": "",
+                    "chunk_index": si,
+                    "source_file": "_schema",
+                    "page_numbers": "schema",
+                    "start_page": 0,
+                    "end_page": 0
+                }
+            )
+            doc_id += 1
+        total_chunks += len(schema_chunks)
+        print(f"  Indexed {len(schema_chunks)} schema chunk(s)")
+
     for doc in documents:
         print(f"\nProcessing: {doc['name']} ({doc['type']})")
         print(f"File: {doc['path']}")
- 
-        chunks_with_metadata = process_pdf(doc['path'], doc['name'], doc['type'])
+
+        if doc['file_type'] == 'pdf':
+            chunks_with_metadata = process_pdf(doc['path'], doc['name'], doc['type'])
+        elif doc['file_type'] == 'csv':
+            chunks_with_metadata = process_csv(doc['path'], lookups=lookups)
+        else:
+            print(f"  Skipping unsupported file type: {doc['path']}")
+            continue
         chunk_count = len(chunks_with_metadata)
         total_chunks += chunk_count
         doc_chunk_counts[(doc['name'], doc['type'])] = chunk_count
@@ -314,6 +660,8 @@ try:
                     "content_vector": vector,
                     "doc_name": chunk_data['doc_name'],
                     "doc_type": chunk_data['doc_type'],
+                    "source_type": chunk_data.get('source_type', 'pdf'),
+                    "table_name": chunk_data.get('table_name', ''),
                     "chunk_index": chunk_data['chunk_index'],
                     "source_file": chunk_data['source_file'],
                     "page_numbers": chunk_data['page_numbers'],
@@ -344,5 +692,5 @@ except FileNotFoundError as e:
     print(f"Error: {e}")
     sys.exit(1)
 except Exception as e:
-    print(f"Error processing PDFs: {e}")
+    print(f"Error processing documents: {e}")
     sys.exit(1)

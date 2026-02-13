@@ -138,7 +138,10 @@ def get_chunks_with_pages(pdf_path, min_tokens=CHUNK_MIN_TOKENS, max_tokens=CHUN
 
 def main():
     """Test the paragraph-aware chunking with page metadata."""
-    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    _default_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    data_dir = os.getenv("DATA_DIR", _default_data_dir)
+    if not os.path.isabs(data_dir):
+        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), data_dir)
     
     # Find first PDF in data directory
     pdf_files = [f for f in os.listdir(data_dir) if f.lower().endswith('.pdf')]
