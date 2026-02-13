@@ -1,9 +1,6 @@
-opensearch-py
-sentence-transformers
-pypdf
-transformers
-torch
-python-dotenv
-accelerate
-google-genai
-
+nltk==3.9.2
+opensearch-py==3.1.0
+pypdf==6.6.2
+python-dotenv==1.2.1
+sentence-transformers==5.2.2
+tiktoken==0.12.0
