@@ -17,6 +17,27 @@ services:
     networks:
       - opensearch-net
 
+  rag:
+    build:
+      context: .
+      dockerfile: rag/Dockerfile
+    container_name: chemlabs-rag
+    ports:
+      - "5000:5000"
+    environment:
+      - OPENSEARCH_HOST=opensearch
+      - OPENSEARCH_PORT=9200
+      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-1.5-flash}
+      - DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      - opensearch
+    networks:
+      - opensearch-net
+
 volumes:
   opensearch-data:
 

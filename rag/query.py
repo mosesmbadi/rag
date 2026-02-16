@@ -9,8 +9,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Connect to OpenSearch (same setup as main.py)
+OPENSEARCH_HOST = os.getenv('OPENSEARCH_HOST', 'localhost')
+OPENSEARCH_PORT = int(os.getenv('OPENSEARCH_PORT', '9200'))
 client = OpenSearch(
-    hosts=[{'host': 'localhost', 'port': 9200}],
+    hosts=[{'host': OPENSEARCH_HOST, 'port': OPENSEARCH_PORT}],
     use_ssl=False
 )
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')

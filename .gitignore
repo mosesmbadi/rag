@@ -12,4 +12,5 @@ venv/
 uploads/
 db/
 
-data/
+wall_e/data/
+wall_e/data_old/
