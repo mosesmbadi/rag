@@ -1,7 +1,7 @@
 import os
 
 from flask import Flask, request, jsonify
-from query import answer_question, search_pdf, DOCUMENT_CATALOG
+from query import answer_question, search_pdf, DOCUMENT_CATALOG, MIN_RELEVANCE_SCORE
 
 app = Flask(__name__)
 
@@ -22,8 +22,16 @@ def query():
     k = int(data.get('k', 10))
     use_llm = bool(data.get('use_llm', True))
     doc_filter = data.get('doc_filter') or None
+    min_score = float(data.get('min_score', MIN_RELEVANCE_SCORE))
 
-    result = answer_question(question, k=k, use_llm=use_llm, doc_filter=doc_filter)
+    import query as q_module
+    original = q_module.MIN_RELEVANCE_SCORE
+    q_module.MIN_RELEVANCE_SCORE = min_score
+    try:
+        result = answer_question(question, k=k, use_llm=use_llm, doc_filter=doc_filter)
+    finally:
+        q_module.MIN_RELEVANCE_SCORE = original
+
     return jsonify(result)
 
 
@@ -41,6 +49,7 @@ def search():
 
     results = search_pdf(query_text, k=k, use_hybrid=use_hybrid, doc_filter=doc_filter)
     return jsonify({'results': results})
+
 
 
 @app.route('/catalog', methods=['GET'])

@@ -16,7 +16,13 @@ client = OpenSearch(
     use_ssl=False
 )
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-index_name = "my_pdf_index"
+
+# Derive index name from DATA_DIR, matching the convention used by main.py
+# e.g. DATA_DIR=.../data/eqa-monthly → eqa_monthly_index
+_default_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+_data_dir = os.getenv("DATA_DIR", _default_data_dir)
+_dir_basename = os.path.basename(_data_dir.rstrip('/'))
+index_name = re.sub(r'[^a-z0-9]+', '_', _dir_basename.lower()).strip('_') + '_index'
 
 
 def normalize_doc_key(text):
@@ -139,6 +145,9 @@ def infer_doc_filter_from_question(question):
         }
 
     return None
+
+# Minimum relevance score — results below this are considered noise
+MIN_RELEVANCE_SCORE = float(os.getenv('MIN_RELEVANCE_SCORE', '0.5'))
 
 # Load LLM configuration
 LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'gemini')
@@ -409,10 +418,13 @@ def answer_question(question, k=10, use_llm=True, doc_filter=None):
     results = search_pdf(question, k, doc_filter=effective_filter)
     if not results and effective_filter:
         results = search_pdf(question, k, doc_filter=None)
-    
+
+    # Drop chunks that are below the relevance threshold
+    results = [r for r in results if r['score'] >= MIN_RELEVANCE_SCORE]
+
     if not results:
         return {
-            'answer': 'No relevant information found in the document.',
+            'answer': 'I could not find relevant information in the documents to answer that question.',
             'sources': []
         }
     
