@@ -23,12 +23,13 @@ def query():
     use_llm = bool(data.get('use_llm', True))
     doc_filter = data.get('doc_filter') or None
     min_score = float(data.get('min_score', MIN_RELEVANCE_SCORE))
+    history = data.get('history') or None  # list of {role, content} dicts
 
     import query as q_module
     original = q_module.MIN_RELEVANCE_SCORE
     q_module.MIN_RELEVANCE_SCORE = min_score
     try:
-        result = answer_question(question, k=k, use_llm=use_llm, doc_filter=doc_filter)
+        result = answer_question(question, k=k, use_llm=use_llm, doc_filter=doc_filter, history=history)
     finally:
         q_module.MIN_RELEVANCE_SCORE = original
 

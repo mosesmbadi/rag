@@ -17,12 +17,19 @@ client = OpenSearch(
 )
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
-# Derive index name from DATA_DIR, matching the convention used by main.py
-# e.g. DATA_DIR=.../data/eqa-monthly → eqa_monthly_index
-_default_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-_data_dir = os.getenv("DATA_DIR", _default_data_dir)
-_dir_basename = os.path.basename(_data_dir.rstrip('/'))
-index_name = re.sub(r'[^a-z0-9]+', '_', _dir_basename.lower()).strip('_') + '_index'
+# Resolve which OpenSearch indices to search.
+# INDEX_NAMES takes priority: comma-separated list of index names.
+# Falls back to deriving a single index name from DATA_DIR basename.
+_index_names_env = os.getenv("INDEX_NAMES", "").strip()
+if _index_names_env:
+    index_name = ",".join(n.strip() for n in _index_names_env.split(",") if n.strip())
+else:
+    _default_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    _data_dir = os.getenv("DATA_DIR", _default_data_dir)
+    _dir_basename = os.path.basename(_data_dir.rstrip('/'))
+    index_name = re.sub(r'[^a-z0-9]+', '_', _dir_basename.lower()).strip('_') + '_index'
+
+print(f"Searching index/indices: {index_name}")
 
 
 def normalize_doc_key(text):
@@ -291,43 +298,53 @@ def search_pdf(query, k=10, use_hybrid=True, doc_filter=None):
         print(f"Error searching: {e}")
         return []
 
-def generate_answer_with_gemini(question, context_chunks):
+def generate_answer_with_gemini(question, context_chunks, history=None):
     """
     Use Gemini API to generate a coherent answer from retrieved chunks.
-    
+
     Args:
         question: The user's question
         context_chunks: List of relevant text chunks
-    
+        history: Optional list of prior turns [{'role': 'user'|'assistant', 'content': '...'}]
+
     Returns:
         Generated answer string
     """
     if not gemini_model:
         return "Gemini API not configured. Please set GEMINI_API_KEY in .env file."
-    
-    # Combine context chunks with clear separation - use up to 8 chunks
-    # for better cross-table coverage
+
+    # Combine context chunks
     context_parts = []
     for i, chunk in enumerate(context_chunks[:8], 1):
         source_label = chunk.get('table_name') or chunk.get('doc_name', '')
         source_type = chunk.get('source_type', 'unknown')
         context_parts.append(f"[Context {i} | source: {source_label} ({source_type})]:\n{chunk['text']}")
     context = "\n\n".join(context_parts)
-    
-    # Create prompt for Gemini - aware of relational data
-    prompt = f"""Answer the following question using the information from the provided context.
 
+    # Build conversation history block
+    history_block = ""
+    if history:
+        turns = []
+        for turn in history[-6:]:  # keep last 6 turns (3 rounds) to stay within token limits
+            role = "User" if turn.get("role") == "user" else "Assistant"
+            turns.append(f"{role}: {turn.get('content', '').strip()}")
+        if turns:
+            history_block = "Conversation so far:\n" + "\n".join(turns) + "\n\n"
+
+    prompt = f"""You are a helpful assistant answering questions about laboratory data and documents.
+
+{history_block}The context below contains relevant information retrieved for the current question.
 The context may contain data from multiple related database tables or documents.
 Foreign key columns (ending in _id) link records across tables. Resolved names
 (ending in _name) show the human-readable value for those foreign keys.
-Use information from ALL relevant context chunks to build a complete answer.
 
 Context:
 {context}
 
-Question: {question}
+Current question: {question}
 
 Instructions:
+- Use the conversation history to understand references to prior answers (e.g. "that program", "those labs")
 - Extract and synthesize relevant information from the context
 - Cross-reference data from different tables when answering
 - If you find the answer in the context, provide it clearly and completely
@@ -345,34 +362,44 @@ Answer:"""
     except Exception as e:
         return f"Error generating answer with Gemini: {e}"
 
-def generate_answer_with_local_llm(question, context_chunks):
+def generate_answer_with_local_llm(question, context_chunks, history=None):
     """
     Use a local LLM to generate a coherent answer from retrieved chunks.
-    
+
     Args:
         question: The user's question
         context_chunks: List of relevant text chunks
-    
+        history: Optional list of prior turns [{'role': 'user'|'assistant', 'content': '...'}]
+
     Returns:
         Generated answer string
     """
     load_llm()
-    
-    # Combine context chunks with clear separation
+
+    # Combine context chunks
     context_parts = []
     for i, chunk in enumerate(context_chunks[:5], 1):
         source_label = chunk.get('table_name') or chunk.get('doc_name', '')
         context_parts.append(f"[Context {i} | source: {source_label}]:\n{chunk['text']}")
     context = "\n\n".join(context_parts)
-    
-    # Create a more strict prompt to reduce hallucinations
+
+    # Build history block
+    history_block = ""
+    if history:
+        turns = []
+        for turn in history[-4:]:
+            role = "User" if turn.get("role") == "user" else "Assistant"
+            turns.append(f"{role}: {turn.get('content', '').strip()}")
+        if turns:
+            history_block = "Conversation so far:\n" + "\n".join(turns) + "\n\n"
+
     prompt = f"""<|system|>
-You are a precise technical assistant. Answer the question using ONLY information from the provided context. Do not add any information not present in the context. If the context doesn't contain enough information to answer the question, say "The provided context does not contain sufficient information to answer this question."</|system|>
+You are a precise technical assistant. Answer the question using ONLY information from the provided context and conversation history. Do not add any information not present in the context. If the context doesn't contain enough information, say "The provided context does not contain sufficient information to answer this question."</|system|>
 <|user|>
-Context from document:
+{history_block}Context:
 {context}
 
-Question: {question}
+Current question: {question}
 
 Answer based strictly on the context above:</|user|>
 <|assistant|>"""
@@ -401,25 +428,37 @@ Answer based strictly on the context above:</|user|>
     
     return answer
 
-def answer_question(question, k=10, use_llm=True, doc_filter=None):
+def answer_question(question, k=10, use_llm=True, doc_filter=None, history=None):
     """
-    Answer a question based on the PDF content.
-    
+    Answer a question based on indexed content.
+
     Args:
         question: The question to answer
         k: Number of relevant chunks to retrieve (default: 10)
         use_llm: Whether to use LLM for answer generation (default: True)
-        doc_filter: Optional dict to filter by document {'doc_name': 'HumaCount 5D', 'doc_type': 'Service Manual'}
-    
+        doc_filter: Optional dict to filter by document
+        history: Optional list of prior turns [{'role': 'user'|'assistant', 'content': '...'}]
+                 Pass the full conversation so the LLM can resolve follow-up references.
+
     Returns:
         Dictionary with 'answer' and 'sources'
     """
-    effective_filter = doc_filter or infer_doc_filter_from_question(question)
-    results = search_pdf(question, k, doc_filter=effective_filter)
-    if not results and effective_filter:
-        results = search_pdf(question, k, doc_filter=None)
+    # Build a search query that incorporates recent history context for better retrieval
+    search_query = question
+    if history:
+        # Prepend the last user question to improve kNN retrieval for follow-ups
+        last_user = next(
+            (t['content'] for t in reversed(history) if t.get('role') == 'user'), None
+        )
+        if last_user and last_user.strip() != question.strip():
+            search_query = f"{last_user} {question}"
 
-    # Drop chunks that are below the relevance threshold
+    effective_filter = doc_filter or infer_doc_filter_from_question(question)
+    results = search_pdf(search_query, k, doc_filter=effective_filter)
+    if not results and effective_filter:
+        results = search_pdf(search_query, k, doc_filter=None)
+
+    # Drop chunks below the relevance threshold
     results = [r for r in results if r['score'] >= MIN_RELEVANCE_SCORE]
 
     if not results:
@@ -427,18 +466,15 @@ def answer_question(question, k=10, use_llm=True, doc_filter=None):
             'answer': 'I could not find relevant information in the documents to answer that question.',
             'sources': []
         }
-    
+
     if use_llm:
-        # Generate answer using configured LLM provider
-        # Use more chunks for better cross-table context
         if LLM_PROVIDER == 'gemini':
-            answer = generate_answer_with_gemini(question, results[:8])
+            answer = generate_answer_with_gemini(question, results[:8], history=history)
         else:
-            answer = generate_answer_with_local_llm(question, results[:5])
+            answer = generate_answer_with_local_llm(question, results[:5], history=history)
     else:
-        # Simple concatenation (old method)
         answer = "\n\n".join([f"[Relevance: {r['score']:.2f}]\n{r['text']}" for r in results])
-    
+
     return {
         'answer': answer,
         'sources': results,

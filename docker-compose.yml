@@ -29,6 +29,7 @@ services:
       - OPENSEARCH_HOST=opensearch
       - OPENSEARCH_PORT=9200
       - DATA_DIR=/app/data
+      - INDEX_NAMES=eqa_monthly_index,eqa_quarterly_index
     volumes:
       - ./data:/app/data:ro
     depends_on:
