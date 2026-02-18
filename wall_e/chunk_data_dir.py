@@ -28,11 +28,14 @@ if not os.path.isdir(data_dir):
     sys.exit(1)
 
 index_name = dir_to_index_name(data_dir)
+fresh = '--fresh' in sys.argv
 print(f"Data directory : {data_dir}")
 print(f"Target index   : {index_name}")
+if fresh:
+    print("Mode: fresh (existing index will be deleted and recreated)")
 
 # ── Prepare index ─────────────────────────────────────────────────────────────
-ensure_index(index_name)
+ensure_index(index_name, fresh=fresh)
 
 # ── Build FK lookups ──────────────────────────────────────────────────────────
 print("\nBuilding FK lookup tables...")

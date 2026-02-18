@@ -16,6 +16,8 @@ Optional env vars:
     MAX_ROWS_PER_TABLE=50000   # skip tables larger than this (default: 50000)
     LOOKUP_MAX_ROWS=5000       # max rows loaded for FK reference tables (default: 5000)
     STREAM_BATCH=2000          # rows fetched per database cursor batch (default: 2000)
+
+Rule of thumb: always use --fresh after an interrupted run to avoid stale orphan chunks.    
 """
 import sys
 import os
@@ -109,18 +111,27 @@ def get_table_meta(conn) -> dict[str, dict]:
 
 def fetch_lookup_tables(conn, table_meta: dict) -> dict[str, list[dict]]:
     """
-    Fetch only small reference tables (those with both 'id' and 'name' columns
-    and estimated row count ≤ LOOKUP_MAX_ROWS). These are the only tables needed
-    for FK resolution — no need to load large data tables.
+    Fetch only small reference tables (those with both 'id' and 'name' columns).
+    Uses an exact COUNT for tables where pg_class estimate is 0 or unreliable.
     """
     lookup_tables = {}
     for tbl, meta in table_meta.items():
         cols = meta['columns']
         if 'id' not in cols or 'name' not in cols:
             continue
-        if meta['row_count'] > LOOKUP_MAX_ROWS:
-            continue
+
+        # pg_class estimates can be 0 for unvacuumed tables — do an exact count
+        # only for tables that look like small reference tables (estimate ≤ LOOKUP_MAX_ROWS or 0)
+        estimated = meta['row_count']
+        if estimated > LOOKUP_MAX_ROWS:
+            continue  # definitely too large
+
         try:
+            with conn.cursor() as cur:
+                cur.execute(f'SELECT COUNT(*) FROM "{tbl}"')  # noqa: S608
+                exact_count = cur.fetchone()[0]
+            if exact_count > LOOKUP_MAX_ROWS:
+                continue
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(f'SELECT * FROM "{tbl}" LIMIT {LOOKUP_MAX_ROWS}')  # noqa: S608
                 lookup_tables[tbl] = [dict(r) for r in cur.fetchall()]
@@ -133,10 +144,11 @@ def fetch_lookup_tables(conn, table_meta: dict) -> dict[str, list[dict]]:
 # ── Streaming chunker ─────────────────────────────────────────────────────────
 
 def stream_and_index_table(conn, table_name: str, lookups: dict,
-                           index_name: str, start_id: int) -> int:
+                           index_name: str, start_id: int,
+                           total_rows: int = 0) -> int:
     """
     Stream rows from table_name in batches, chunk each batch, embed and index.
-    Returns total number of chunks indexed.
+    Prints progress every batch. Returns total chunks indexed.
     """
     total_indexed = 0
     rows_seen = 0
@@ -157,12 +169,20 @@ def stream_and_index_table(conn, table_name: str, lookups: dict,
                 doc_id += indexed
                 total_indexed += indexed
 
+            progress = f"{rows_seen:,}"
+            if total_rows:
+                pct = min(100, rows_seen * 100 // total_rows)
+                progress += f"/{total_rows:,} ({pct}%)"
+            print(f"    {progress} rows processed, {total_indexed} chunk(s) indexed...",
+                  end='\r', flush=True)
+
+    print(f"    {rows_seen:,} rows → {total_indexed} chunk(s)               ")
     return total_indexed
 
 
 # ── Per-database pipeline ─────────────────────────────────────────────────────
 
-def process_database(config: dict):
+def process_database(config: dict, fresh: bool = False):
     db_name = config['name']
     index_name = db_name_to_index(db_name)
 
@@ -188,7 +208,7 @@ def process_database(config: dict):
     print(f"  {len(lookups)} FK reference table(s) resolved from {len(lookup_rows)} lookup table(s).")
 
     # 3. Create index
-    ensure_index(index_name)
+    ensure_index(index_name, fresh=fresh)
 
     # 4. Index schema document
     schema_text = build_schema_document_from_rows(
@@ -212,9 +232,10 @@ def process_database(config: dict):
         if row_count == 0:
             continue
 
-        print(f"  {tbl}: ~{row_count} rows — streaming and indexing...")
+        print(f"  {tbl}: ~{row_count:,} rows — streaming and indexing...")
         try:
-            indexed = stream_and_index_table(conn, tbl, lookups, index_name, start_id=doc_id_offset)
+            indexed = stream_and_index_table(conn, tbl, lookups, index_name,
+                                             start_id=doc_id_offset, total_rows=row_count)
             doc_id_offset += indexed
             total_chunks += indexed
         except Exception as e:
@@ -233,11 +254,14 @@ def process_database(config: dict):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    fresh = '--fresh' in sys.argv
     configs = get_db_configs()
     print(f"Processing {len(configs)} database(s)...")
     print(f"Row limit per table: {MAX_ROWS_PER_TABLE:,}  (MAX_ROWS_PER_TABLE)")
+    if fresh:
+        print("Mode: fresh (existing indexes will be deleted and recreated)")
     for config in configs:
-        process_database(config)
+        process_database(config, fresh=fresh)
     print(f"\nAll databases processed.")
 
 

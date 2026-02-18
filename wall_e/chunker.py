@@ -75,10 +75,18 @@ INDEX_BODY = {
 }
 
 
-def ensure_index(index_name: str):
-    """Create the index if it doesn't already exist."""
+def ensure_index(index_name: str, fresh: bool = False):
+    """
+    Create the index if it doesn't exist.
+    If fresh=True, delete and recreate it (clean slate for re-runs).
+    """
     try:
-        if client.indices.exists(index=index_name):
+        exists = client.indices.exists(index=index_name)
+        if exists and fresh:
+            print(f"Deleting existing index '{index_name}' (--fresh)...")
+            client.indices.delete(index=index_name)
+            exists = False
+        if exists:
             print(f"Index '{index_name}' already exists. Using existing index.")
         else:
             print(f"Creating index '{index_name}'...")
